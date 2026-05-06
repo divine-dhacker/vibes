@@ -1536,10 +1536,14 @@ try{app=initializeApp(FB);auth=getAuth(app);db=getFirestore(app);}catch(e){conso
 
 // ── ONESIGNAL PUSH NOTIFICATIONS ──
 const ONESIGNAL_APP_ID='b5a57967-95c6-4e68-8a23-c92279067dea';
+/**
+ * SECURITY WARNING: The REST_KEY below is exposed client-side.
+ * This allows anyone to send notifications. In a production app,
+ * this should be handled by a secure backend or Cloud Function.
+ */
 const ONESIGNAL_REST_KEY='os_v2_app_wwsxsz4vyzhgrcrdzerhsbt55lmjm2om47tushv3enoqwiw2mz3ic4qabdltoykudiq7gsgzp3t7g6vrkf3qeypl5gt6zynlcg7pnoy';
 
 // Initialize OneSignal immediately on page load — silently, no popup yet
-// This MUST run early so OneSignal is ready when user taps Allow
 window.OneSignalDeferred=window.OneSignalDeferred||[];
 OneSignalDeferred.push(async(OneSignal)=>{
   await OneSignal.init({
@@ -1549,29 +1553,28 @@ OneSignalDeferred.push(async(OneSignal)=>{
     welcomeNotification:{disable:true},
     autoResubscribe:true
   });
-  // If already subscribed, grab the player ID quietly
   const id=await OneSignal.User.PushSubscription.id;
   if(id) window._osUid=id;
+  if(user) OneSignal.login(user.uid);
 });
 
 function initPush(){
   if(!('Notification' in window))return;
-  if(Notification.permission==='denied')return;
-  // Only show our custom modal if never asked before
-  if(!localStorage.getItem('gr_notif_asked')){
+  // If not granted, always show our prompt as requested
+  if(Notification.permission!=='granted'){
     setTimeout(()=>openModal('notif-modal'),3000);
   }
 }
 
-// Send push to everyone in a room
+// Send push to everyone in a room except sender
 async function sendPushToRoom(roomId,title,message){
   try{
-    // Get current user's OneSignal ID to exclude them from receiving their own push
-    const myOsId=window._osUid||null;
     const body={
       app_id:ONESIGNAL_APP_ID,
       filters:[
-        {field:'tag',key:'room_'+roomId,relation:'=',value:'1'}
+        {field:'tag',key:'room_'+roomId,relation:'=',value:'1'},
+        {operator:'AND'},
+        {field:'tag',key:'uid',relation:'!=',value:user?.uid||'none'}
       ],
       headings:{en:title||'👻 GhostRoom'},
       contents:{en:message},
@@ -1579,8 +1582,6 @@ async function sendPushToRoom(roomId,title,message){
       chrome_web_icon:'https://raw.githubusercontent.com/divine-dhacker/vibes/main/ghostrooms.png',
       firefox_icon:'https://raw.githubusercontent.com/divine-dhacker/vibes/main/ghostrooms.png'
     };
-    // Exclude sender so they don't get their own notification
-    if(myOsId) body.excluded_external_user_ids=[myOsId];
     await fetch('https://onesignal.com/api/v1/notifications',{
       method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Basic '+ONESIGNAL_REST_KEY},
@@ -1592,9 +1593,17 @@ async function sendPushToRoom(roomId,title,message){
 // Send push to specifically mentioned users
 async function sendMentionPush(roomId,senderHandle,mentionedHandles,preview){
   try{
+    // Filter to room members who are also one of the mentioned handles
+    // Since OneSignal filters are complex for large lists, we'll send to the room but with a targetted title
+    // Actually, a better way would be tagging users by handle, but handles are not unique or permanent.
+    // For now, notifying the whole room that a mention happened is the best we can do with current tag structure.
     const body={
       app_id:ONESIGNAL_APP_ID,
-      filters:[{field:'tag',key:'room_'+roomId,relation:'=',value:'1'}],
+      filters:[
+        {field:'tag',key:'room_'+roomId,relation:'=',value:'1'},
+        {operator:'AND'},
+        {field:'tag',key:'uid',relation:'!=',value:user?.uid||'none'}
+      ],
       headings:{en:`👋 ${senderHandle} mentioned you`},
       contents:{en:preview||'You were mentioned in a message'},
       url:'https://ghostrooom.vercel.app/#'+roomId,
@@ -1608,17 +1617,13 @@ async function sendMentionPush(roomId,senderHandle,mentionedHandles,preview){
   }catch(e){console.warn('Mention push failed:',e);}
 }
 
-// Tag user as member of a room so we can target them
+// Tag user as member of a room and set their UID tag for exclusion
 function tagUserInRoom(roomId){
   try{
-    if(window.OneSignal&&OneSignal.User){
-      OneSignal.User.addTag('room_'+roomId,'1');
-    } else {
-      // Fallback: queue it for when SDK is ready
-      OneSignalDeferred.push(os=>{
-        os.User.addTag('room_'+roomId,'1');
-      });
-    }
+    OneSignalDeferred.push(os=>{
+      os.User.addTag('room_'+roomId,'1');
+      if(user) os.User.addTag('uid', user.uid);
+    });
   }catch(e){console.warn('Tag failed:',e);}
 }
 
@@ -2319,6 +2324,7 @@ function listenChat(rid){
     const wasAtBottom=container.scrollHeight-container.scrollTop-container.clientHeight<100;
     const prevCount=container.querySelectorAll('.msg-row').length;
     cachedMsgs=snap.docs.map(d=>({...d.data(),id:d.id}));
+    updateRoomRoster(cachedMsgs);
     container.innerHTML='';
     let lastUid=null,lastDay=null;
     snap.docs.forEach(ds=>{
@@ -2327,6 +2333,7 @@ function listenChat(rid){
       const burned=m.status==='burned';
       const isImage=m.type==='image';
       const isSticker=m.type==='sticker';
+      const isPoll=m.type==='poll';
       const isOwnerMsg=currentRoom&&currentRoom.ownerId===m.uid;
       if(m.createdAt){
         const ts=toMs(m.createdAt)||Date.now();
@@ -2346,13 +2353,14 @@ function listenChat(rid){
         const lbl=el('div',`sender-lbl${isOwnerMsg?' owner':''}`,isOwnerMsg?'Room Owner':(m.identity==='custom'?(m.customName||'Anonymous'):`Anon ${m.uid.slice(0,4).toUpperCase()}`));
         wrap.appendChild(lbl);
       }
-      const bigEmoji=!isImage&&!isSticker&&isOnlyEmoji(m.text||'');
+      const bigEmoji=!isImage&&!isSticker&&!isPoll&&isOnlyEmoji(m.text||'');
       let bubClass=`msg-bubble ${isMe?'me':'them'}`;
       if(m.isGhost&&!burned)bubClass+=' ghost-msg';
       if(burned)bubClass+=' burned';
       if(bigEmoji)bubClass+=' big-emoji';
       if(isOwnerMsg&&!isMe)bubClass+=' owner-msg';
       if(isSticker)bubClass+=' sticker-bubble';
+      if(isPoll)bubClass+=' poll-bubble';
       const bub=el('div',bubClass);
       bub.id=`msg-${mid}`;
       if(isImage&&!burned){
@@ -2366,6 +2374,22 @@ function listenChat(rid){
         img.style.cssText='max-width:160px;max-height:160px;display:block;';
         img.onclick=ev=>{ev.stopPropagation();openLightbox(m.stickerUrl);};
         bub.appendChild(img);
+      } else if(isPoll&&!burned){
+        bub.style.cssText='padding:14px 16px;min-width:220px;max-width:280px;';
+        const q=el('div','poll-question',m.question);
+        bub.appendChild(q);
+        const options=m.options||[];
+        const totalVotes=options.reduce((sum,o)=>(sum+(o.votes?o.votes.length:0)),0);
+        options.forEach((opt,idx)=>{
+          const optEl=el('div','poll-option');
+          if(opt.votes&&opt.votes.includes(user.uid)) optEl.classList.add('voted');
+          const pct=totalVotes>0?Math.round(((opt.votes?opt.votes.length:0)/totalVotes)*100):0;
+          optEl.innerHTML=`<div class="poll-bar" style="width:${pct}%"></div><div class="poll-label">${opt.text}</div><div class="poll-pct">${pct}%</div>`;
+          optEl.onclick=ev=>{ev.stopPropagation();votePoll(mid,idx);};
+          bub.appendChild(optEl);
+        });
+        const footer=el('div','poll-footer',`${totalVotes} vote${totalVotes!==1?'s':''}`);
+        bub.appendChild(footer);
       } else {
         if(m.replyToText){
           const rq=el('div','reply-q');
@@ -2455,7 +2479,7 @@ function listenChat(rid){
       attachLongPress(wrap,bub,mid,isMe,m.text||'');
       row.appendChild(wrap);
       // Swipe to reply works on ALL message types including images and stickers
-      const swipeText=m.type==='image'?'📷 Image':m.type==='sticker'?'🎉 Sticker':(m.text||'');
+      const swipeText=m.type==='image'?'📷 Image':m.type==='sticker'?'🎉 Sticker':m.type==='poll'?'📊 Poll':(m.text||'');
       attachSwipe(wrap,bub,mid,swipeText);
       container.appendChild(row);
     });
@@ -2475,23 +2499,6 @@ function listenChat(rid){
     if(snap.docs.length>prevCount&&prevCount>0)playSound('recv');
     if(wasAtBottom)container.scrollTop=container.scrollHeight;
 
-    // Send push to everyone else in the room when a new message arrives
-    if(snap.docs.length>prevCount&&prevCount>0){
-      const newest=snap.docs[snap.docs.length-1].data();
-      if(newest){
-        const handle=newest.handle||(newest.identity==='custom'?newest.customName:null)||'Someone';
-        const preview=newest.type==='sticker'?'Sent a sticker 🎉':(newest.type==='image'?'Sent an image 📷':(newest.text||'').slice(0,80));
-        // Always send push — the sendPushToRoom function excludes the sender via OneSignal excludedExternalUserIds
-        sendPushToRoom(currentRoom?.id||'',`${handle} in #${(currentRoom?.id||'').toUpperCase()}`,preview);
-        // If message mentions someone via #handle, send them a special mention push
-        if(newest.text&&newest.uid===user?.uid){
-          const mentioned=[...newest.text.matchAll(/#([A-Za-z]+\s[A-Za-z]+\s\d+)/g)].map(m=>m[1]);
-          if(mentioned.length>0){
-            sendMentionPush(currentRoom?.id||'',handle,mentioned,newest.text.slice(0,80));
-          }
-        }
-      }
-    }
 
     // read glow — fire on bubbles that scroll into view
     requestAnimationFrame(()=>{
@@ -2686,6 +2693,13 @@ async function sendMsg(){
 
   try{
     await addDoc(collection(db,'artifacts',AID,'public','data','rooms',currentRoom.id,'messages'),payload);
+    const pushHandle=payload.identity==='custom'?payload.customName:payload.handle;
+    const mentioned=[...text.matchAll(/#([A-Za-z]+(?:\s[A-Za-z]+)?\s?\d*)/g)].map(m=>m[1]);
+    if(mentioned.length>0){
+      sendMentionPush(currentRoom.id,pushHandle,mentioned,text.slice(0,80));
+    } else {
+      sendPushToRoom(currentRoom.id,`${pushHandle} in #${currentRoom.id.toUpperCase()}`,text.slice(0,80));
+    }
     if(currentRoom.type==='request'&&user.uid!==currentRoom.ownerId){
       const oRef=doc(db,'artifacts',AID,'users',currentRoom.ownerId,'history',currentRoom.id);
       const oSnap=await getDoc(oRef);
@@ -2735,7 +2749,11 @@ $('file-input').onchange=async()=>{
       const cv=document.createElement('canvas');cv.width=img.width;cv.height=img.height;
       cv.getContext('2d').drawImage(img,0,0);
       const clean=cv.toDataURL('image/jpeg',.85);
-      try{await addDoc(collection(db,'artifacts',AID,'public','data','rooms',currentRoom.id,'messages'),{uid:user.uid,type:'image',imageData:clean,createdAt:serverTimestamp(),status:'active',identity,isGhost});}
+    try{
+      await addDoc(collection(db,'artifacts',AID,'public','data','rooms',currentRoom.id,'messages'),{uid:user.uid,type:'image',imageData:clean,createdAt:serverTimestamp(),status:'active',identity,customName:identity==='custom'?($('custom-name').value||null):null,handle:myHandle,isGhost});
+      const pushHandle=identity==='custom'?($('custom-name').value||'Someone'):myHandle;
+      sendPushToRoom(currentRoom.id,`${pushHandle} in #${currentRoom.id.toUpperCase()}`,'Sent an image 📷');
+    }
       catch(e){toast('Image send failed');}
     };img.src=ev.target.result;
   };reader.readAsDataURL(file);
@@ -2753,7 +2771,9 @@ $('screen-chat').addEventListener('drop',async e=>{
       const cv=document.createElement('canvas');cv.width=img.width;cv.height=img.height;
       cv.getContext('2d').drawImage(img,0,0);
       const clean=cv.toDataURL('image/jpeg',.85);
-      await addDoc(collection(db,'artifacts',AID,'public','data','rooms',currentRoom.id,'messages'),{uid:user.uid,type:'image',imageData:clean,createdAt:serverTimestamp(),status:'active',identity,isGhost}).catch(()=>toast('Drop failed'));
+    await addDoc(collection(db,'artifacts',AID,'public','data','rooms',currentRoom.id,'messages'),{uid:user.uid,type:'image',imageData:clean,createdAt:serverTimestamp(),status:'active',identity,customName:identity==='custom'?($('custom-name').value||null):null,handle:myHandle,isGhost}).catch(()=>toast('Drop failed'));
+    const pushHandle=identity==='custom'?($('custom-name').value||'Someone'):myHandle;
+    sendPushToRoom(currentRoom.id,`${pushHandle} in #${currentRoom.id.toUpperCase()}`,'Sent an image 📷');
     };img.src=ev.target.result;
   };r.readAsDataURL(file);
 });
@@ -2833,7 +2853,7 @@ function showMentionDropdown(query){
   dd.innerHTML=filtered.map((h,i)=>{
     const color=mentionColor(h);
     const initials=h.split(' ').slice(0,2).map(w=>w[0]).join('');
-    return `<div class="mention-opt" data-handle="${h}" data-idx="${i}">
+    return `<div class="mention-opt${i===0?' focused':''}" data-handle="${h}" data-idx="${i}">
       <div class="mention-avatar" style="background:${color}22;color:${color}">${initials}</div>
       <span class="mention-handle">${h}</span>
       <span class="mention-badge">tap to mention</span>
@@ -2877,6 +2897,11 @@ $('chat-input').addEventListener('input',function(){
     gifDebounce=setTimeout(()=>loadStickers(q||currentGifQuery),350);
     return; // don't auto-grow in sticker mode
   }
+
+  const q=getMentionQuery(this.value,this.selectionStart);
+  if(q!=null){showMentionDropdown(q);}
+  else{hideMentionDropdown();}
+
   // Play typing sound here too — mobile virtual keyboards fire input but not keydown with a real key
   if(!_typedViaKeydown)playTypingSound();
   _typedViaKeydown=false;
@@ -2887,6 +2912,23 @@ $('chat-input').addEventListener('input',function(){
 
 // Enter key: in sticker mode just searches, doesn't send
 $('chat-input').addEventListener('keydown',e=>{
+  if($('mention-dropdown').classList.contains('show')){
+    if(e.key==='Escape'){hideMentionDropdown();e.preventDefault();return;}
+    if(e.key==='Enter'){
+      const focused=$('mention-dropdown').querySelector('.mention-opt.focused');
+      if(focused){insertMention(focused.dataset.handle);e.preventDefault();return;}
+    }
+    if(e.key==='ArrowDown'||e.key==='ArrowUp'){
+      e.preventDefault();
+      const opts=[...$('mention-dropdown').querySelectorAll('.mention-opt')];
+      const cur=opts.findIndex(o=>o.classList.contains('focused'));
+      let next=cur+(e.key==='ArrowDown'?1:-1);
+      if(next<0)next=opts.length-1;if(next>=opts.length)next=0;
+      opts.forEach((o,i)=>o.classList.toggle('focused',i===next));
+      opts[next].scrollIntoView({block:'nearest'});
+      return;
+    }
+  }
   if(gifPanelOpen){
     if(e.key==='Escape'){closeGifPanel();}
     // prevent send while in sticker mode
@@ -3000,7 +3042,10 @@ async function sendSticker(url){
   playSound('send');
   await addDoc(collection(db,'artifacts',AID,'public','data','rooms',currentRoom.id,'messages'),{
     uid:user.uid,type:'sticker',stickerUrl:url,
-    createdAt:serverTimestamp(),status:'active',identity,isGhost,handle:myHandle
+    createdAt:serverTimestamp(),status:'active',identity,customName:identity==='custom'?($('custom-name').value||null):null,isGhost,handle:myHandle
+  }).then(()=>{
+    const pushHandle=identity==='custom'?($('custom-name').value||'Someone'):myHandle;
+    sendPushToRoom(currentRoom.id,`${pushHandle} in #${currentRoom.id.toUpperCase()}`,'Sent a sticker 🎉');
   }).catch(()=>toast('Sticker send failed'));
 }
 
@@ -3038,6 +3083,7 @@ function attachSwipe(wrap,bub,mid,text){
     triggered=false;
     dragging=true;sx=cx=e.touches?e.touches[0].clientX:e.clientX;
     bub.classList.add('dragging');
+    if(!e.touches) _globalDragTarget = { move, up };
   };
   const move=e=>{
     if(!dragging)return;
@@ -3062,9 +3108,17 @@ function attachSwipe(wrap,bub,mid,text){
   bub.addEventListener('touchmove',move,{passive:true});
   bub.addEventListener('touchend',up);
   bub.addEventListener('mousedown',down);
-  window.addEventListener('mousemove',move);
-  window.addEventListener('mouseup',up);
+  // Do NOT add window listeners here as they will be duplicated for every message
 }
+// Add window listeners ONCE
+let _globalDragTarget=null;
+window.addEventListener('mousemove',e=>{
+  if(_globalDragTarget) _globalDragTarget.move(e);
+});
+window.addEventListener('mouseup',e=>{
+  if(_globalDragTarget) _globalDragTarget.up(e);
+  _globalDragTarget=null;
+});
 
 // ── REPLY ──
 function showReply(r){replyingTo=r;$('reply-txt').textContent=r.text.length>60?r.text.slice(0,60)+'…':r.text;document.querySelector('.reply-lbl').textContent='Replying to';$('reply-bar').classList.add('show');$('btn-cancel-reply').onclick=clearReply;}
@@ -3240,10 +3294,57 @@ function loadHistory(){
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&gifPanelOpen){closeGifPanel();}});
 const ks=document.createElement('style');ks.textContent='@keyframes nudge-shake{0%,100%{transform:translate(0)}20%{transform:translate(-8px,4px)}40%{transform:translate(8px,-4px)}60%{transform:translate(-6px,2px)}80%{transform:translate(4px,-2px)}}@keyframes fadeIn{from{opacity:0}to{opacity:1}}';document.head.appendChild(ks);
 
+// ── POLL LOGIC ──
+$('btn-add-poll-option').onclick=()=>{
+  const list=$('poll-options-list');
+  if(list.children.length>=6){toast('Max 6 options');return;}
+  const inp=el('input','poll-opt-input');
+  inp.type='text';inp.placeholder=`Option ${list.children.length+1}`;
+  inp.maxLength=80;
+  inp.style.cssText='width:100%;background:var(--s2);border:1px solid var(--b1);border-radius:12px;padding:11px 14px;font-family:inherit;font-size:13px;color:var(--t1);outline:none;box-sizing:border-box;';
+  list.appendChild(inp);
+};
+
+$('btn-confirm-poll').onclick=async()=>{
+  const question=$('poll-question').value.trim();
+  const opts=[...document.querySelectorAll('.poll-opt-input')].map(i=>i.value.trim()).filter(v=>v);
+  if(!question||opts.length<2){toast('Question and at least 2 options required');return;}
+  closeModal('poll-modal');
+
+  if(!currentRoom||!user)return;
+  const pollData={
+    uid:user.uid,type:'poll',
+    question,options:opts.map(o=>({text:o,votes:[]})),
+    createdAt:serverTimestamp(),status:'active',identity,
+    customName:identity==='custom'?($('custom-name').value||null):null,handle:myHandle
+  };
+  try{
+    await addDoc(collection(db,'artifacts',AID,'public','data','rooms',currentRoom.id,'messages'),pollData);
+    const pushHandle=identity==='custom'?($('custom-name').value||'Someone'):myHandle;
+    sendPushToRoom(currentRoom.id,`${pushHandle} created a poll 📊`,question);
+    // Reset modal
+    $('poll-question').value='';
+    const list=$('poll-options-list');
+    list.innerHTML=`<input type="text" class="poll-opt-input" style="width:100%;background:var(--s2);border:1px solid var(--b1);border-radius:12px;padding:11px 14px;font-family:inherit;font-size:13px;color:var(--t1);outline:none;box-sizing:border-box;" placeholder="Option 1" maxlength="80"><input type="text" class="poll-opt-input" style="width:100%;background:var(--s2);border:1px solid var(--b1);border-radius:12px;padding:11px 14px;font-family:inherit;font-size:13px;color:var(--t1);outline:none;box-sizing:border-box;" placeholder="Option 2" maxlength="80">`;
+  }catch(e){toast('Poll failed');}
+};
+
+async function votePoll(mid,optIdx){
+  if(!currentRoom||!user)return;
+  const msgRef=doc(db,'artifacts',AID,'public','data','rooms',currentRoom.id,'messages',mid);
+  const snap=await getDoc(msgRef);if(!snap.exists())return;
+  const data=snap.data();
+  const options=data.options||[];
+  // Remove user's vote from any other option
+  options.forEach(o=>{o.votes=o.votes.filter(v=>v!==user.uid);});
+  // Add vote to selected option
+  if(!options[optIdx].votes.includes(user.uid)) options[optIdx].votes.push(user.uid);
+  await updateDoc(msgRef,{options}).catch(()=>{});
+}
+
 // ── NOTIFICATION MODAL BUTTONS ──
 $('btn-notif-allow').onclick=async()=>{
   closeModal('notif-modal');
-  localStorage.setItem('gr_notif_asked','1');
   // Use OneSignal's own method — this triggers the browser system popup correctly
   OneSignalDeferred.push(async(OneSignal)=>{
     await OneSignal.Notifications.requestPermission();
@@ -3253,7 +3354,6 @@ $('btn-notif-allow').onclick=async()=>{
 };
 $('btn-notif-skip').onclick=()=>{
   closeModal('notif-modal');
-  localStorage.setItem('gr_notif_asked','1');
 };
 
 // ── START ──
