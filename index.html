@@ -1544,11 +1544,12 @@ function initPush(){
 }
 
 function _ensureTagged(){
-  // Make sure uid tag is set if already subscribed
-  OneSignalDeferred.push(os=>{
-    const id=os.User?.PushSubscription?.id;
-    if(id&&user?.uid) os.User.addTag('uid_'+user.uid,'1');
-    if(id&&window._currentRoomForTag) os.User.addTag('room_'+window._currentRoomForTag,'1');
+  OneSignalDeferred.push(os => {
+    const id = os.User?.PushSubscription?.id;
+    if(!id) return; // not subscribed, tagUserInRoom will handle it when they enter a room
+    if(user?.uid) os.User.addTag('uid_' + user.uid, '1');
+    if(window._currentRoomForTag) os.User.addTag('room_' + window._currentRoomForTag, '1');
+    window._osUid = id;
   });
 }
 
@@ -1574,18 +1575,21 @@ async function sendPushToRoom(roomId,title,message){
 
 // Tag user as member of a room so we can target them
 function tagUserInRoom(roomId){
-  window._currentRoomForTag=roomId;
-  try{
-    if(window.OneSignal&&OneSignal.User&&OneSignal.User.PushSubscription.id){
-      OneSignal.User.addTag('room_'+roomId,'1');
-    } else {
-      OneSignalDeferred.push(os=>{
-        if(os.User.PushSubscription.id){
-          os.User.addTag('room_'+roomId,'1');
-        }
-      });
-    }
-  }catch(e){console.warn('Tag failed:',e);}
+  window._currentRoomForTag = roomId;
+  OneSignalDeferred.push(os => {
+    const tryTag = () => {
+      const id = os.User?.PushSubscription?.id;
+      if(id){
+        os.User.addTag('room_' + roomId, '1');
+        if(user?.uid) os.User.addTag('uid_' + user.uid, '1');
+        window._osUid = id;
+      } else {
+        // Not subscribed yet — retry every 2s (covers post-permission-grant flow)
+        setTimeout(tryTag, 2000);
+      }
+    };
+    tryTag();
+  });
 }
 
 // Remove tag when user leaves room
